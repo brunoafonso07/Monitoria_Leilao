@@ -2,38 +2,38 @@ import hashlib
 import json
 import os
 import re
+import sys
 from datetime import datetime, timezone
 
+import requests
 from bs4 import BeautifulSoup
-from curl_cffi import requests
 
 URL = "https://www.leiloeirosdebrasilia.com.br/item/4134/detalhes?page=15"
 STATE_FILE = "state.json"
 
 
-def fetch_page() -> str:
-    headers = {
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-        "cache-control": "no-cache",
-        "pragma": "no-cache",
-        "referer": "https://www.leiloeirosdebrasilia.com.br/",
-        "upgrade-insecure-requests": "1",
-    }
-
-    response = requests.get(
-        URL,
-        headers=headers,
-        impersonate="chrome",   # importante
-        timeout=30,
-        allow_redirects=True,
-    )
-    response.raise_for_status()
-    return response.text
-
-
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def fetch_page() -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.leiloeirosdebrasilia.com.br/",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    response = requests.get(URL, headers=headers, timeout=40, allow_redirects=True)
+    response.raise_for_status()
+    response.encoding = response.apparent_encoding or response.encoding
+    return response.text
 
 
 def extract_snapshot(html: str) -> dict:
@@ -45,20 +45,14 @@ def extract_snapshot(html: str) -> dict:
     if h1:
         title = normalize_text(h1.get_text(" ", strip=True))
 
-    status = ""
-    if "Aberto para Lances" in page_text:
-        status = "Aberto para Lances"
+    status = "Aberto para Lances" if "Aberto para Lances" in page_text else ""
 
-    ultimos_lances = ""
     match = re.search(
         r"Últimos Lances(.*?)(Documentos|Detalhes do Lote|Observações do Lote|Localização do Imóvel|CONTATOS)",
         page_text,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    if match:
-        ultimos_lances = normalize_text(match.group(1))
-    else:
-        ultimos_lances = "Seção não localizada"
+    ultimos_lances = normalize_text(match.group(1)) if match else "Seção não localizada"
 
     found_bid_indicators = []
     bid_patterns = [
@@ -96,14 +90,14 @@ def load_previous_state():
         return json.load(f)
 
 
-def save_state(state: dict) -> None:
+def save_state(state: dict):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
 def should_notify(previous, current):
     if previous is None:
-        return False, "Primeira execução; estado salvo sem notificar."
+        return False, "Primeira execução; apenas salvando estado."
 
     reasons = []
 
@@ -121,7 +115,7 @@ def should_notify(previous, current):
     return (len(reasons) > 0, " ".join(reasons))
 
 
-def send_telegram(message_text: str) -> None:
+def send_telegram(message_text: str):
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
@@ -154,30 +148,29 @@ def build_message(previous, current, reason: str) -> str:
     )
 
 
-def main() -> None:
+def main():
     try:
         html = fetch_page()
     except Exception as e:
-        # opcional: notifica falha de acesso
         send_telegram(f"⚠️ Falha ao acessar o leilão: {type(e).__name__}: {e}")
         raise
 
     current = extract_snapshot(html)
     previous = load_previous_state()
 
-    notify, reason = should_notify(previous, current)
-
     print(json.dumps(current, ensure_ascii=False, indent=2))
 
+    notify, reason = should_notify(previous, current)
+
     if notify:
-        message = build_message(previous, current, reason)
-        send_telegram(message)
-        print(f"Notificação enviada: {reason}")
-    else:
-        print("Nenhuma mudança relevante detectada.")
+        send_telegram(build_message(previous, current, reason))
 
     save_state(current)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"ERRO: {exc}", file=sys.stderr)
+        raise
