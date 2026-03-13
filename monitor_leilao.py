@@ -4,8 +4,8 @@ import os
 import re
 from datetime import datetime, timezone
 
-import requests
 from bs4 import BeautifulSoup
+from curl_cffi import requests
 
 URL = "https://www.leiloeirosdebrasilia.com.br/item/4134/detalhes?page=15"
 STATE_FILE = "state.json"
@@ -13,15 +13,22 @@ STATE_FILE = "state.json"
 
 def fetch_page() -> str:
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/123.0 Safari/537.36"
-        )
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "cache-control": "no-cache",
+        "pragma": "no-cache",
+        "referer": "https://www.leiloeirosdebrasilia.com.br/",
+        "upgrade-insecure-requests": "1",
     }
-    response = requests.get(URL, headers=headers, timeout=30)
+
+    response = requests.get(
+        URL,
+        headers=headers,
+        impersonate="chrome",   # importante
+        timeout=30,
+        allow_redirects=True,
+    )
     response.raise_for_status()
-    response.encoding = response.apparent_encoding or response.encoding
     return response.text
 
 
@@ -82,7 +89,7 @@ def extract_snapshot(html: str) -> dict:
     }
 
 
-def load_previous_state() -> dict | None:
+def load_previous_state():
     if not os.path.exists(STATE_FILE):
         return None
     with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -94,9 +101,9 @@ def save_state(state: dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def should_notify(previous: dict | None, current: dict) -> tuple[bool, str]:
+def should_notify(previous, current):
     if previous is None:
-        return True, "Primeira execução do monitor."
+        return False, "Primeira execução; estado salvo sem notificar."
 
     reasons = []
 
@@ -106,7 +113,9 @@ def should_notify(previous: dict | None, current: dict) -> tuple[bool, str]:
     if normalize_text(previous.get("ultimos_lances", "")) != normalize_text(current.get("ultimos_lances", "")):
         reasons.append("A seção 'Últimos Lances' foi alterada.")
 
-    if current.get("found_bid_indicators") and not previous.get("found_bid_indicators"):
+    prev_has_bid = bool(previous.get("found_bid_indicators"))
+    curr_has_bid = bool(current.get("found_bid_indicators"))
+    if curr_has_bid and not prev_has_bid:
         reasons.append("Possível lance identificado.")
 
     return (len(reasons) > 0, " ".join(reasons))
@@ -129,8 +138,8 @@ def send_telegram(message_text: str) -> None:
     response.raise_for_status()
 
 
-def build_message(previous: dict | None, current: dict, reason: str) -> str:
-    old_lances = previous.get("ultimos_lances", "(sem estado anterior)") if previous else "(primeira execução)"
+def build_message(previous, current, reason: str) -> str:
+    old_lances = previous.get("ultimos_lances", "(sem estado anterior)") if previous else "(sem estado anterior)"
     new_lances = current.get("ultimos_lances", "")
 
     return (
@@ -146,7 +155,13 @@ def build_message(previous: dict | None, current: dict, reason: str) -> str:
 
 
 def main() -> None:
-    html = fetch_page()
+    try:
+        html = fetch_page()
+    except Exception as e:
+        # opcional: notifica falha de acesso
+        send_telegram(f"⚠️ Falha ao acessar o leilão: {type(e).__name__}: {e}")
+        raise
+
     current = extract_snapshot(html)
     previous = load_previous_state()
 
