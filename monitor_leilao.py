@@ -2,11 +2,7 @@ import hashlib
 import json
 import os
 import re
-import smtplib
-import ssl
 from datetime import datetime, timezone
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 import requests
 from bs4 import BeautifulSoup
@@ -30,8 +26,7 @@ def fetch_page() -> str:
 
 
 def normalize_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    return text
+    return re.sub(r"\s+", " ", text or "").strip()
 
 
 def extract_snapshot(html: str) -> dict:
@@ -39,7 +34,7 @@ def extract_snapshot(html: str) -> dict:
     page_text = soup.get_text("\n", strip=True)
 
     title = ""
-    h1 = soup.find(["h1"])
+    h1 = soup.find("h1")
     if h1:
         title = normalize_text(h1.get_text(" ", strip=True))
 
@@ -47,7 +42,6 @@ def extract_snapshot(html: str) -> dict:
     if "Aberto para Lances" in page_text:
         status = "Aberto para Lances"
 
-    # Extrai um trecho entre "Últimos Lances" e a próxima seção conhecida
     ultimos_lances = ""
     match = re.search(
         r"Últimos Lances(.*?)(Documentos|Detalhes do Lote|Observações do Lote|Localização do Imóvel|CONTATOS)",
@@ -59,20 +53,19 @@ def extract_snapshot(html: str) -> dict:
     else:
         ultimos_lances = "Seção não localizada"
 
-    # Heurística para identificar possível lance
-    # Você pode ajustar depois se o site mudar.
     found_bid_indicators = []
     bid_patterns = [
         r"R\$\s?[\d\.\,]+",
-        r"lance automático",
-        r"lance superado",
+        r"lance",
+        r"oferta",
+        r"ofertado",
         r"usuário",
         r"apelido",
-        r"ofertado",
+        r"superado",
     ]
-    lower_text = ultimos_lances.lower()
+
     for pattern in bid_patterns:
-        if re.search(pattern, lower_text, flags=re.IGNORECASE):
+        if re.search(pattern, ultimos_lances, flags=re.IGNORECASE):
             found_bid_indicators.append(pattern)
 
     snapshot_text = f"{title}\nSTATUS:{status}\nULTIMOS_LANCES:{ultimos_lances}"
@@ -101,7 +94,7 @@ def save_state(state: dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def should_send_email(previous: dict | None, current: dict) -> tuple[bool, str]:
+def should_notify(previous: dict | None, current: dict) -> tuple[bool, str]:
     if previous is None:
         return True, "Primeira execução do monitor."
 
@@ -110,11 +103,8 @@ def should_send_email(previous: dict | None, current: dict) -> tuple[bool, str]:
     if previous.get("digest") != current.get("digest"):
         reasons.append("Mudança detectada no conteúdo monitorado.")
 
-    prev_bids = normalize_text(previous.get("ultimos_lances", ""))
-    curr_bids = normalize_text(current.get("ultimos_lances", ""))
-
-    if prev_bids != curr_bids:
-        reasons.append("Seção 'Últimos Lances' foi alterada.")
+    if normalize_text(previous.get("ultimos_lances", "")) != normalize_text(current.get("ultimos_lances", "")):
+        reasons.append("A seção 'Últimos Lances' foi alterada.")
 
     if current.get("found_bid_indicators") and not previous.get("found_bid_indicators"):
         reasons.append("Possível lance identificado.")
@@ -122,58 +112,37 @@ def should_send_email(previous: dict | None, current: dict) -> tuple[bool, str]:
     return (len(reasons) > 0, " ".join(reasons))
 
 
-def build_email(previous: dict | None, current: dict, reason: str) -> MIMEMultipart:
-    subject = "Alerta de leilão: mudança detectada no lote 441"
+def send_telegram(message_text: str) -> None:
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
-    prev_text = previous.get("ultimos_lances", "(sem estado anterior)") if previous else "(primeira execução)"
-    curr_text = current.get("ultimos_lances", "")
-
-    body = f"""
-Mudança detectada no site monitorado.
-
-Motivo:
-{reason}
-
-URL:
-{current['url']}
-
-Título:
-{current.get('title', '')}
-
-Status:
-{current.get('status', '')}
-
-Últimos Lances (anterior):
-{prev_text}
-
-Últimos Lances (atual):
-{curr_text}
-
-Indicadores de lance encontrados:
-{", ".join(current.get("found_bid_indicators", [])) or "nenhum"}
-
-Verificado em:
-{current.get("checked_at_utc")}
-""".strip()
-
-    msg = MIMEMultipart()
-    msg["From"] = os.environ["EMAIL_FROM"]
-    msg["To"] = os.environ["EMAIL_TO"]
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain", "utf-8"))
-    return msg
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    response = requests.post(
+        url,
+        json={
+            "chat_id": chat_id,
+            "text": message_text,
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
 
 
-def send_email(message: MIMEMultipart) -> None:
-    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-    smtp_port = int(os.environ.get("SMTP_PORT", "465"))
-    smtp_user = os.environ["SMTP_USER"]
-    smtp_pass = os.environ["SMTP_PASS"]
+def build_message(previous: dict | None, current: dict, reason: str) -> str:
+    old_lances = previous.get("ultimos_lances", "(sem estado anterior)") if previous else "(primeira execução)"
+    new_lances = current.get("ultimos_lances", "")
 
-    context = ssl.create_default_context()
-    with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context) as server:
-        server.login(smtp_user, smtp_pass)
-        server.send_message(message)
+    return (
+        "🚨 Alerta do leilão\n\n"
+        f"Motivo: {reason}\n\n"
+        f"Título: {current.get('title', '')}\n"
+        f"Status: {current.get('status', '')}\n"
+        f"URL: {current.get('url', '')}\n\n"
+        f"Últimos Lances (anterior):\n{old_lances}\n\n"
+        f"Últimos Lances (atual):\n{new_lances}\n\n"
+        f"Verificado em: {current.get('checked_at_utc')}"
+    )
 
 
 def main() -> None:
@@ -181,15 +150,14 @@ def main() -> None:
     current = extract_snapshot(html)
     previous = load_previous_state()
 
-    send, reason = should_send_email(previous, current)
+    notify, reason = should_notify(previous, current)
 
-    print("Resumo atual:")
     print(json.dumps(current, ensure_ascii=False, indent=2))
 
-    if send:
-        print(f"Enviando email: {reason}")
-        message = build_email(previous, current, reason)
-        send_email(message)
+    if notify:
+        message = build_message(previous, current, reason)
+        send_telegram(message)
+        print(f"Notificação enviada: {reason}")
     else:
         print("Nenhuma mudança relevante detectada.")
 
